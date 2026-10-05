@@ -6,6 +6,8 @@
 - 参与者只能改自己的稿、读被分配的稿（不返回他人姓名/链接）、提交意见。
 - 改稿立即使针对它的已交意见失效；提交绑定所读稿件版本，过期提交拒绝且不覆盖有效意见。
 - 每篇当前稿都有有效意见时才可一次公布；公布后作者可见匿名意见，稿件与意见锁定。
+- 公布后作者可对收到的意见提一次澄清问题，对应评审者答复一次；每条意见一问一答，
+  问答只随参与状态快照返回给该作者与评审者，主持台与其他参与者均不可见。
 - 所有写操作在 BEGIN IMMEDIATE 事务内"先检查后变更"，拒绝即整体回滚，不留部分变更。
 - 状态读取（参与页、主持台）在单个只读事务内完成：整个响应取自同一快照；
   WAL 下读取不阻塞其他连接的写入，写入也不阻塞读取。
@@ -55,13 +57,26 @@ CREATE TABLE IF NOT EXISTS reviews (
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (session_id, reviewer_id)
 );
+-- 公布后的一问一答：每条意见至多一条澄清，问题/答案提交后不可修改
+CREATE TABLE IF NOT EXISTS clarifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    review_id INTEGER NOT NULL UNIQUE REFERENCES reviews(id),
+    question TEXT NOT NULL,
+    answer TEXT,
+    asked_at TEXT NOT NULL DEFAULT (datetime('now')),
+    answered_at TEXT
+);
 """
 
 app = Flask(__name__)
 
 
 def init_db():
-    """建库建表（幂等），数据落盘在 DB_PATH，重启后保留。"""
+    """建库建表（幂等），数据落盘在 DB_PATH，重启后保留。
+
+    旧版数据库（无 clarifications 表）启动时自动补建问答表，
+    既有 sessions/participants/reviews 数据原样保留。
+    """
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA journal_mode=WAL")
@@ -141,6 +156,23 @@ def review_is_current(review_row, target_row):
         and review_row["valid"]
         and review_row["target_version"] == target_row["version"]
     )
+
+
+def find_clarification(conn, review_id):
+    return conn.execute(
+        "SELECT * FROM clarifications WHERE review_id=?", (review_id,)
+    ).fetchone()
+
+
+def clarification_view(row):
+    """问答对外结构：只含问/答文本，不含任何身份信息与私密链接。"""
+    if row is None:
+        return None
+    return {
+        "question": row["question"],
+        "answer": row["answer"],
+        "answered": row["answer"] is not None,
+    }
 
 
 # ---------------- 页面 ----------------
@@ -289,7 +321,7 @@ def publish(host_token):
 
 @app.get("/api/p/<token>")
 def participant_state(token):
-    """参与页数据：同一快照读取；不含他人姓名与任何私密链接；公布前不含收到的意见。"""
+    """参与页数据：同一快照读取；不含他人姓名与任何私密链接；公布前不含收到的意见与问答。"""
     conn = get_db()
     try:
         # 只读事务：本人稿件、分配稿件、版本、意见与公布状态取自同一快照；
@@ -318,6 +350,9 @@ def participant_state(token):
             },
             "my_review": None,
             "received": None,
+            # 一问一答：公布前一律 None；公布后只返回与本人相关的那条意见的问答
+            "received_clarification": None,
+            "my_review_clarification": None,
         }
         if my_review is not None:
             resp["my_review"] = {
@@ -325,13 +360,23 @@ def participant_state(token):
                 "version": my_review["target_version"],
                 "valid": review_is_current(my_review, target),
             }
+            # 评审者视角：我提交的那条意见收到的澄清（公布后才可见，且仅本人可见）
+            if published:
+                resp["my_review_clarification"] = clarification_view(
+                    find_clarification(conn, my_review["id"])
+                )
         if published:
             # 匿名：只返回意见内容，不返回评审人任何信息
             row = conn.execute(
-                "SELECT content FROM reviews WHERE target_id=? AND valid=1 AND target_version=?",
+                "SELECT * FROM reviews WHERE target_id=? AND valid=1 AND target_version=?",
                 (me["id"], me["version"]),
             ).fetchone()
-            resp["received"] = row["content"] if row else None
+            if row is not None:
+                resp["received"] = row["content"]
+                # 作者视角：就我收到的这条意见的一问一答（仅本人与对应评审者可见）
+                resp["received_clarification"] = clarification_view(
+                    find_clarification(conn, row["id"])
+                )
         conn.commit()
         return jsonify(resp)
     except Exception:
@@ -420,6 +465,104 @@ def submit_review(token):
                           updated_at=datetime('now')
             """,
             (me["session_id"], me["id"], target["id"], version, content),
+        )
+        conn.commit()
+        return jsonify({"ok": True})
+    except Exception:
+        conn.rollback()
+        raise
+
+
+# ---------------- 公布后的一问一答 ----------------
+
+
+@app.post("/api/p/<token>/question")
+def ask_clarification(token):
+    """作者就自己收到的意见提一次澄清问题：公布后开放，每条意见至多一问，提交不可修改。"""
+    data = request.get_json(silent=True) or {}
+    question = data.get("question")
+    # 文本沿用现有意见的非空及长度限制
+    if not isinstance(question, str) or not question.strip() or len(question) > MAX_TEXT_LEN:
+        return err(f"问题不能为空且不超过 {MAX_TEXT_LEN} 字")
+
+    conn = get_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        me = find_participant(conn, token)
+        if me is None:
+            conn.rollback()
+            return err("个人链接无效", 404)
+        session = conn.execute(
+            "SELECT * FROM sessions WHERE id=?", (me["session_id"],)
+        ).fetchone()
+        # 公布前提问一律 409，且不改变任何数据
+        if not session["published"]:
+            conn.rollback()
+            return err("尚未公布，不能提问", 409)
+        # 服务端按个人链接确定身份与对应意见：只能问自己收到的那条有效意见
+        review = conn.execute(
+            "SELECT * FROM reviews WHERE target_id=? AND valid=1 AND target_version=?",
+            (me["id"], me["version"]),
+        ).fetchone()
+        if review is None:
+            conn.rollback()
+            return err("没有可追问的意见", 409)
+        # 每条意见只容纳一问；重复提交 409
+        if find_clarification(conn, review["id"]) is not None:
+            conn.rollback()
+            return err("该意见已经提过问，不能重复提问或修改", 409)
+        # review_id UNIQUE：并发提交同一问题最多一次成功，其余触发约束失败
+        conn.execute(
+            "INSERT INTO clarifications (review_id, question) VALUES (?,?)",
+            (review["id"], question),
+        )
+        conn.commit()
+        return jsonify({"ok": True})
+    except Exception:
+        conn.rollback()
+        raise
+
+
+@app.post("/api/p/<token>/answer")
+def answer_clarification(token):
+    """对应评审者就作者的澄清问题答复一次：尚无问题或已答复均 409，提交不可修改。"""
+    data = request.get_json(silent=True) or {}
+    answer = data.get("answer")
+    # 文本沿用现有意见的非空及长度限制
+    if not isinstance(answer, str) or not answer.strip() or len(answer) > MAX_TEXT_LEN:
+        return err(f"答复不能为空且不超过 {MAX_TEXT_LEN} 字")
+
+    conn = get_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        me = find_participant(conn, token)
+        if me is None:
+            conn.rollback()
+            return err("个人链接无效", 404)
+        session = conn.execute(
+            "SELECT * FROM sessions WHERE id=?", (me["session_id"],)
+        ).fetchone()
+        # 公布前答复一律 409
+        if not session["published"]:
+            conn.rollback()
+            return err("尚未公布，不能答复", 409)
+        # 服务端按个人链接确定身份：只能答复本人提交的那条意见上的问题
+        review = find_review_by_reviewer(conn, me["session_id"], me["id"])
+        if review is None:
+            conn.rollback()
+            return err("没有可答复的问题", 409)
+        clarification = find_clarification(conn, review["id"])
+        # 尚无问题时答复 409
+        if clarification is None:
+            conn.rollback()
+            return err("作者尚未提问，暂不能答复", 409)
+        # 每条意见只容纳一答；重复提交 409
+        if clarification["answer"] is not None:
+            conn.rollback()
+            return err("该问题已经答复，不能重复答复或修改", 409)
+        conn.execute(
+            "UPDATE clarifications SET answer=?, answered_at=datetime('now') WHERE id=? AND answer IS NULL",
+            (answer, clarification["id"]),
         )
         conn.commit()
         return jsonify({"ok": True})

@@ -40,11 +40,42 @@
       </div>
       <p class="muted">提交绑定你当前读到的稿件版本；若对方更新了稿件，需重新阅读后再提交。</p>
       <p id="review-msg"></p>
+
+      <div id="answer-box" class="clarify" hidden>
+        <h3>作者对这条意见的澄清问题</h3>
+        <div id="answer-question" class="clarify-item"></div>
+        <div id="answer-form">
+          <textarea id="answer-input" rows="4" placeholder="对该问题的答复（仅可答复一次，提交后不可修改）"></textarea>
+          <div class="row-actions">
+            <button id="submit-answer" class="primary">提交答复</button>
+          </div>
+          <p id="answer-msg"></p>
+        </div>
+        <div id="answer-done" class="clarify-item" hidden>
+          <strong>我的答复：</strong><span id="answer-text"></span>
+        </div>
+      </div>
     </section>
 
     <section id="received-section" class="card" hidden>
       <h2>我收到的匿名意见</h2>
       <pre id="received" class="manuscript-view"></pre>
+
+      <div id="question-box" class="clarify">
+        <h3>对该意见提出澄清问题</h3>
+        <p class="muted">公布后可就收到的匿名意见提一次澄清问题，对应评审者将答复一次；每条意见仅一问一答，提交后均不可修改。页面不会显示对方姓名或链接。</p>
+        <div id="question-form">
+          <textarea id="question-input" rows="4" placeholder="针对这条意见的澄清问题（仅可提问一次，提交后不可修改）"></textarea>
+          <div class="row-actions">
+            <button id="submit-question" class="primary">提交问题</button>
+          </div>
+          <p id="question-msg"></p>
+        </div>
+        <div id="question-done" class="clarify-item" hidden>
+          <strong>我的问题：</strong><span id="question-text"></span>
+          <p id="answer-view" class="muted"></p>
+        </div>
+      </div>
     </section>
   </div>
 </main>

@@ -62,3 +62,18 @@ pre.manuscript-view {
 }
 .person-head { display: flex; justify-content: space-between; align-items: center; }
 .row-actions { display: flex; gap: 12px; margin: 12px 0 4px; }
+.clarify {
+  border-top: 1px dashed #c9ccd1;
+  margin-top: 14px;
+  padding-top: 10px;
+}
+.clarify h3 { margin: 6px 0; }
+.clarify-item {
+  background: #f6f7f9;
+  border: 1px solid #e3e5e8;
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 8px 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}

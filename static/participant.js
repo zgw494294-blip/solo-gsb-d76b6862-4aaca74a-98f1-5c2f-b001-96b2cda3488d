@@ -18,6 +18,22 @@ const els = {
   publishedBanner: document.getElementById("published-banner"),
   receivedSection: document.getElementById("received-section"),
   received: document.getElementById("received"),
+  questionBox: document.getElementById("question-box"),
+  questionForm: document.getElementById("question-form"),
+  questionInput: document.getElementById("question-input"),
+  submitQuestion: document.getElementById("submit-question"),
+  questionMsg: document.getElementById("question-msg"),
+  questionDone: document.getElementById("question-done"),
+  questionText: document.getElementById("question-text"),
+  answerView: document.getElementById("answer-view"),
+  answerBox: document.getElementById("answer-box"),
+  answerQuestion: document.getElementById("answer-question"),
+  answerForm: document.getElementById("answer-form"),
+  answerInput: document.getElementById("answer-input"),
+  submitAnswer: document.getElementById("submit-answer"),
+  answerMsg: document.getElementById("answer-msg"),
+  answerDone: document.getElementById("answer-done"),
+  answerText: document.getElementById("answer-text"),
 };
 
 let firstLoad = true;
@@ -92,7 +108,53 @@ function render(s) {
     els.received.textContent = s.received !== null ? s.received : "（无）";
   }
 
+  renderQuestion(s.published ? s.received_clarification : null);
+  renderAnswer(s.published ? s.my_review_clarification : null);
+
   firstLoad = false;
+}
+
+// 作者视角：对收到的匿名意见的一问一答
+function renderQuestion(c) {
+  // 尚未提问：仅在状态位允许时保持输入框可编辑；轮询不触碰输入框，避免覆盖正在输入的内容
+  if (!c) {
+    els.questionForm.hidden = false;
+    els.questionDone.hidden = true;
+    return;
+  }
+  // 一旦问题已提交（本地或其他标签页）：锁定为只读问答，输入框整体隐藏
+  els.questionForm.hidden = true;
+  els.questionDone.hidden = false;
+  els.questionText.textContent = c.question;
+  if (c.answered) {
+    els.answerView.textContent = "";
+    els.answerView.className = "clarify-item";
+    els.answerView.textContent = "对方答复：" + c.answer;
+  } else {
+    els.answerView.className = "muted";
+    els.answerView.textContent = "已提交，等待对方答复。";
+  }
+}
+
+// 评审者视角：作者对我所交意见的提问与我的答复
+function renderAnswer(c) {
+  if (!c) {
+    els.answerBox.hidden = true;
+    return;
+  }
+  els.answerBox.hidden = false;
+  // 问题原文只读，直接以服务端快照展示
+  els.answerQuestion.textContent = c.question;
+  if (c.answered) {
+    // 答复已提交：锁定只读，隐藏输入区（答复内容以服务端快照为准）
+    els.answerForm.hidden = true;
+    els.answerDone.hidden = false;
+    els.answerText.textContent = c.answer;
+  } else {
+    // 尚无答复：显示输入区，但轮询不触碰输入框 value，避免覆盖正在输入的答复
+    els.answerForm.hidden = false;
+    els.answerDone.hidden = true;
+  }
 }
 
 els.saveMs.addEventListener("click", async () => {
@@ -137,6 +199,54 @@ els.submitReview.addEventListener("click", async () => {
     setMsg(els.reviewMsg, "网络错误，请重试", true);
   }
   refresh();
+});
+
+async function submitOnce(btn, path, payload, msgEl, okText) {
+  btn.disabled = true;
+  setMsg(msgEl, "");
+  try {
+    const r = await fetch("/api/p/" + token + path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      btn.disabled = false;
+      setMsg(msgEl, data.error || "提交失败", true);
+      return false;
+    }
+    setMsg(msgEl, okText);
+    return true;
+  } catch {
+    btn.disabled = false;
+    setMsg(msgEl, "网络错误，请重试", true);
+    return false;
+  }
+}
+
+els.submitQuestion.addEventListener("click", async () => {
+  const ok = await submitOnce(
+    els.submitQuestion,
+    "/question",
+    { question: els.questionInput.value },
+    els.questionMsg,
+    "问题已提交，等待对方答复。"
+  );
+  refresh(); // 成功后用快照锁定为只读；失败也刷新以发现其他标签页的并发提交
+  if (ok) els.questionInput.value = "";
+});
+
+els.submitAnswer.addEventListener("click", async () => {
+  const ok = await submitOnce(
+    els.submitAnswer,
+    "/answer",
+    { answer: els.answerInput.value },
+    els.answerMsg,
+    "答复已提交。"
+  );
+  refresh(); // 成功后用快照锁定为只读；失败也刷新以发现其他标签页的并发提交
+  if (ok) els.answerInput.value = "";
 });
 
 refresh();

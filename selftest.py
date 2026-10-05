@@ -108,6 +108,27 @@ def submit_review(client, token, content, version):
     )
 
 
+def ask(client, token, question):
+    return client.post(
+        f"/api/p/{token}/question", json={"question": question}
+    )
+
+
+def answer(client, token, reply):
+    return client.post(
+        f"/api/p/{token}/answer", json={"answer": reply}
+    )
+
+
+def publish_with_reviews(client, host_token, tokens, reviews=("甲评乙", "乙评丙", "丙评甲")):
+    """三人首轮意见全部提交并一次公布，返回各 token。"""
+    for tok, content in zip(tokens, reviews):
+        resp = submit_review(client, tok, content, 1)
+        assert resp.status_code == 200, resp.get_json()
+    resp = client.post(f"/api/h/{host_token}/publish")
+    assert resp.status_code == 200, resp.get_json()
+
+
 # ---------------- 用例 ----------------
 
 
@@ -301,6 +322,294 @@ class ExistingRulesTest(unittest.TestCase):
         # 无效链接 404
         self.assertEqual(self.client.get("/api/p/无效").status_code, 404)
         self.assertEqual(self.client.get("/api/h/无效").status_code, 404)
+
+
+class ClarificationTest(unittest.TestCase):
+    """公布后一问一答：409 规则、身份隔离、文本限制、快照读取。"""
+
+    def setUp(self):
+        self.client = new_client()
+        self.host_token, self.tokens = create_session(self.client)
+        self.t_jia, self.t_yi, self.t_bing = self.tokens
+        publish_with_reviews(self.client, self.host_token, self.tokens)
+
+    def test_409_rules_and_full_flow(self):
+        # 公布前不能提问/答复（在另一个新会话上验证，本会话已公布）
+        c2 = new_client()
+        _, t2 = create_session(c2)
+        self.assertEqual(ask(c2, t2[0], "公布前提问").status_code, 409)
+        self.assertEqual(answer(c2, t2[0], "公布前答复").status_code, 409)
+
+        # 甲收到的是丙的意见；尚无问题时答复 409
+        self.assertEqual(answer(self.client, self.t_bing, "抢答").status_code, 409)
+
+        # 甲提问成功
+        resp = ask(self.client, self.t_jia, "请澄清Q1")
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+
+        # 重复提问 409，问题不变
+        resp = ask(self.client, self.t_jia, "再问一次")
+        self.assertEqual(resp.status_code, 409)
+        data = self.client.get(f"/api/p/{self.t_jia}").get_json()
+        self.assertEqual(data["received_clarification"]["question"], "请澄清Q1")
+        self.assertFalse(data["received_clarification"]["answered"])
+        self.assertIsNone(data["received_clarification"]["answer"])
+
+        # 身份隔离：乙不是该意见的评审者（评审者是丙），不能答复甲的问题；
+        # 乙就"自己收到的"意见另开一问是合法的，不影响甲这条一问一答
+        self.assertEqual(ask(self.client, self.t_yi, "乙对自己收到的意见提问").status_code, 200)
+        self.assertEqual(answer(self.client, self.t_yi, "乙来抢答甲的问题").status_code, 409)
+
+        # 评审者丙答复成功
+        resp = answer(self.client, self.t_bing, "答复A1")
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+
+        # 重复答复 409，答复不变
+        resp = answer(self.client, self.t_bing, "再答一次")
+        self.assertEqual(resp.status_code, 409)
+
+        # 双方各自参与页读到同一条问答
+        da = self.client.get(f"/api/p/{self.t_jia}").get_json()
+        db = self.client.get(f"/api/p/{self.t_bing}").get_json()
+        self.assertEqual(
+            da["received_clarification"],
+            {"question": "请澄清Q1", "answer": "答复A1", "answered": True},
+        )
+        self.assertEqual(
+            db["my_review_clarification"],
+            {"question": "请澄清Q1", "answer": "答复A1", "answered": True},
+        )
+
+        # 回答后作者侧仍不能再次提问
+        self.assertEqual(ask(self.client, self.t_jia, "第二个问题").status_code, 409)
+
+    def test_visibility_isolation(self):
+        # 提问前：所有参与页两个问答字段为 None；主持台完全不含问答
+        for tok in self.tokens:
+            data = self.client.get(f"/api/p/{tok}").get_json()
+            self.assertIsNone(data["received_clarification"])
+            self.assertIsNone(data["my_review_clarification"])
+        host_body = self.client.get(f"/api/h/{self.host_token}").get_data(as_text=True)
+        self.assertNotIn("clarification", host_body)
+        self.assertNotIn("question", host_body)
+        self.assertNotIn("answer", host_body)
+
+        ask(self.client, self.t_jia, "甲的问题正文XYZ")
+        answer(self.client, self.t_bing, "丙的答复正文UVW")
+
+        # 甲（作者）：收到问答；自己没提问过别人（甲评乙，乙未问），评审视角为 None
+        da = self.client.get(f"/api/p/{self.t_jia}").get_json()
+        self.assertIsNone(da["my_review_clarification"])
+        self.assertEqual(da["received_clarification"]["question"], "甲的问题正文XYZ")
+
+        # 丙（评审者）：评审视角有问答；丙收到的是乙的意见，乙未提问，作者视角为 None
+        db = self.client.get(f"/api/p/{self.t_bing}").get_json()
+        self.assertIsNone(db["received_clarification"])
+        self.assertEqual(db["my_review_clarification"]["answer"], "丙的答复正文UVW")
+
+        # 乙是无关第三方：两侧都为 None，且响应体不含问答正文
+        body = self.client.get(f"/api/p/{self.t_yi}").get_data(as_text=True)
+        self.assertNotIn("正文XYZ", body)
+        self.assertNotIn("正文UVW", body)
+
+        # 主持状态始终不含问答内容
+        host_body = self.client.get(f"/api/h/{self.host_token}").get_data(as_text=True)
+        self.assertNotIn("正文XYZ", host_body)
+        self.assertNotIn("正文UVW", host_body)
+
+        # 匿名：响应不含对方姓名与任何私密链接
+        self.assertNotIn(self.t_bing, self.client.get(f"/api/p/{self.t_jia}").get_data(as_text=True))
+        self.assertNotIn("甲", self.client.get(f"/api/p/{self.t_bing}").get_data(as_text=True))
+
+    def test_text_limits(self):
+        # 空白与超长均 400（沿用意见的非空及长度限制）
+        self.assertEqual(ask(self.client, self.t_jia, "   ").status_code, 400)
+        self.assertEqual(ask(self.client, self.t_jia, "x" * 100001).status_code, 400)
+        ask(self.client, self.t_jia, "Q")
+        self.assertEqual(answer(self.client, self.t_bing, "").status_code, 400)
+        self.assertEqual(answer(self.client, self.t_bing, "y" * 100001).status_code, 400)
+        # 被拒绝后正常长度仍可走通（失败不改变数据）
+        self.assertEqual(answer(self.client, self.t_bing, "A").status_code, 200)
+
+    def test_failed_attempts_change_nothing(self):
+        # 各种针对甲这条意见的非法尝试后：该意见无问答行产生，原稿与原意见冻结不变
+        answer(self.client, self.t_bing, "提前答复")        # 尚无问题
+        answer(self.client, self.t_yi, "冒名答复")          # 乙不是该意见评审者
+        ask(self.client, self.t_jia, " ")                  # 空白文本
+        conn = sqlite3.connect(app_module.DB_PATH)
+        try:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM clarifications c"
+                " JOIN reviews r ON c.review_id = r.id"
+                " JOIN participants p ON r.target_id = p.id WHERE p.token=?",
+                (self.t_jia,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(count, 0)
+        data = self.client.get(f"/api/p/{self.t_jia}").get_json()
+        self.assertEqual(data["manuscript"], "文本一")
+        self.assertEqual(data["received"], "丙评甲")
+        self.assertEqual(data["version"], 1)
+
+    def test_concurrent_question_only_one_wins(self):
+        results = []
+
+        def worker():
+            c = new_client()
+            results.append(ask(c, self.t_jia, "并发问题").status_code)
+
+        threads = [threading.Thread(target=worker) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+            self.assertFalse(t.is_alive())
+        self.assertEqual(sorted(results), [200, 409, 409, 409, 409])
+        conn = sqlite3.connect(app_module.DB_PATH)
+        try:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM clarifications c"
+                " JOIN reviews r ON c.review_id = r.id"
+                " JOIN participants p ON r.target_id = p.id WHERE p.token=?",
+                (self.t_jia,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(count, 1)
+
+    def test_concurrent_answer_only_one_wins(self):
+        self.assertEqual(ask(self.client, self.t_jia, "问题").status_code, 200)
+        results = []
+
+        def worker():
+            c = new_client()
+            results.append(answer(c, self.t_bing, "并发答复").status_code)
+
+        threads = [threading.Thread(target=worker) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+            self.assertFalse(t.is_alive())
+        self.assertEqual(sorted(results), [200, 409, 409, 409, 409])
+        conn = sqlite3.connect(app_module.DB_PATH)
+        try:
+            row = conn.execute(
+                "SELECT c.question, c.answer FROM clarifications c"
+                " JOIN reviews r ON c.review_id = r.id"
+                " JOIN participants p ON r.target_id = p.id WHERE p.token=?",
+                (self.t_jia,),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row, ("问题", "并发答复"))
+
+    def test_invalid_token_404(self):
+        self.assertEqual(ask(new_client(), "无效链接", "Q").status_code, 404)
+        self.assertEqual(answer(new_client(), "无效链接", "A").status_code, 404)
+
+    def test_qa_in_same_snapshot(self):
+        ask(self.client, self.t_jia, "快照问题")
+        answer(self.client, self.t_bing, "快照答复")
+        # 问答随参与状态在同一响应中读取，且与公布状态、稿件版本一致
+        data = self.client.get(f"/api/p/{self.t_jia}").get_json()
+        self.assertTrue(data["published"])
+        self.assertEqual(data["version"], 1)
+        self.assertEqual(data["received"], "丙评甲")
+        self.assertEqual(data["received_clarification"]["question"], "快照问题")
+        self.assertEqual(data["received_clarification"]["answer"], "快照答复")
+        # 原稿与原意见仍冻结：公布后写操作继续 409
+        self.assertEqual(
+            self.client.put(
+                f"/api/p/{self.t_jia}/manuscript", json={"manuscript": "x"}
+            ).status_code,
+            409,
+        )
+        self.assertEqual(submit_review(self.client, self.t_jia, "x", 1).status_code, 409)
+
+
+class OldSchemaMigrationTest(unittest.TestCase):
+    """旧库启动时自动支持问答存储：补建 clarifications，旧数据保留，重启后内容保留。"""
+
+    OLD_SCHEMA = """
+    CREATE TABLE sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        host_token TEXT NOT NULL UNIQUE,
+        published INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE TABLE participants (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id INTEGER NOT NULL REFERENCES sessions(id),
+        token TEXT NOT NULL UNIQUE,
+        name TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        manuscript TEXT NOT NULL,
+        version INTEGER NOT NULL DEFAULT 1,
+        UNIQUE (session_id, position)
+    );
+    CREATE TABLE reviews (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id INTEGER NOT NULL REFERENCES sessions(id),
+        reviewer_id INTEGER NOT NULL REFERENCES participants(id),
+        target_id INTEGER NOT NULL REFERENCES participants(id),
+        target_version INTEGER NOT NULL,
+        content TEXT NOT NULL,
+        valid INTEGER NOT NULL DEFAULT 1,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE (session_id, reviewer_id)
+    );
+    """
+
+    def test_old_db_auto_upgraded_and_persists(self):
+        tmp_dir = tempfile.mkdtemp(prefix="review-olddb-")
+        old_path = os.path.join(tmp_dir, "old.db")
+        conn = sqlite3.connect(old_path)
+        conn.executescript(self.OLD_SCHEMA)
+        conn.execute("INSERT INTO sessions (id, host_token, published) VALUES (1,'ht',1)")
+        conn.execute(
+            "INSERT INTO participants (id, session_id, token, name, position, manuscript, version)"
+            " VALUES (1,1,'tk','旧库作者',0,'旧稿',1)"
+        )
+        conn.execute(
+            "INSERT INTO reviews (id, session_id, reviewer_id, target_id, target_version, content, valid)"
+            " VALUES (1,1,1,1,1,'旧意见',1)"
+        )
+        conn.commit()
+        conn.close()
+
+        original = app_module.DB_PATH
+        app_module.DB_PATH = old_path
+        try:
+            # 模拟新版本启动：旧库自动补建问答表
+            app_module.init_db()
+
+            c = sqlite3.connect(old_path)
+            try:
+                tables = {
+                    r[0]
+                    for r in c.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+            finally:
+                c.close()
+            self.assertIn("clarifications", tables)
+
+            # 旧数据原样保留，且新表可直接读写
+            client = new_client()
+            data = client.get("/api/p/tk").get_json()
+            self.assertEqual(data["name"], "旧库作者")
+            self.assertEqual(data["received"], "旧意见")
+            self.assertEqual(ask(client, "tk", "旧库追问").status_code, 200)
+
+            # 模拟重启：再次 init_db 幂等，问答内容保留
+            app_module.init_db()
+            data = client.get("/api/p/tk").get_json()
+            self.assertEqual(data["received_clarification"]["question"], "旧库追问")
+        finally:
+            app_module.DB_PATH = original
 
 
 if __name__ == "__main__":
