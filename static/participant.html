@@ -40,11 +40,33 @@
       </div>
       <p class="muted">提交绑定你当前读到的稿件版本；若对方更新了稿件，需重新阅读后再提交。</p>
       <p id="review-msg"></p>
+
+      <div id="answer-section" class="qa" hidden>
+        <h3>作者就这条意见的澄清问答</h3>
+        <p class="muted">一问一答，答复提交后不可修改；页面不会显示对方身份。</p>
+        <div id="answer-qa"></div>
+        <textarea id="answer-input" rows="3" placeholder="作者提问后，可在此答复一次"></textarea>
+        <div class="row-actions">
+          <button id="submit-answer" class="primary">提交答复</button>
+        </div>
+        <p id="answer-msg"></p>
+      </div>
     </section>
 
     <section id="received-section" class="card" hidden>
       <h2>我收到的匿名意见</h2>
       <pre id="received" class="manuscript-view"></pre>
+
+      <div id="question-section" class="qa">
+        <h3>向评审者澄清提问</h3>
+        <p class="muted">公布后可对这条意见提问一次；一问一答，问题提交后不可修改。</p>
+        <div id="received-qa"></div>
+        <textarea id="question-input" rows="3" placeholder="可对收到的匿名意见提一个澄清问题"></textarea>
+        <div class="row-actions">
+          <button id="submit-question" class="primary">提交问题</button>
+        </div>
+        <p id="question-msg"></p>
+      </div>
     </section>
   </div>
 </main>

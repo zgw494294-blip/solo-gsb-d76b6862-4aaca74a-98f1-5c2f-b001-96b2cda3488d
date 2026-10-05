@@ -62,3 +62,13 @@ pre.manuscript-view {
 }
 .person-head { display: flex; justify-content: space-between; align-items: center; }
 .row-actions { display: flex; gap: 12px; margin: 12px 0 4px; }
+.qa { border-top: 1px dashed #e3e5e8; margin-top: 14px; padding-top: 8px; }
+.qa h3 { margin-bottom: 4px; }
+.qa-entry {
+  background: #fbfbfb;
+  border: 1px solid #e3e5e8;
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 8px 0;
+}
+.qa-entry p { margin: 4px 0; white-space: pre-wrap; word-break: break-word; }
